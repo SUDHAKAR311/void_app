@@ -1,0 +1,6 @@
+{
+  "name": "void — Ephemeral P2P Clipboard & File Transfer",
+  "description": "Transfer everything. Store nothing. No trace left behind. High-speed encrypted peer-to-peer file and clipboard transfer using 6-digit codes with zero server storage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
