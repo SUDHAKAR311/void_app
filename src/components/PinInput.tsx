@@ -10,6 +10,7 @@ interface PinInputProps {
   onChange: (val: string) => void;
   onComplete?: (val: string) => void;
   disabled?: boolean;
+  onAttemptWhenDisabled?: () => void;
 }
 
 export const PinInput: React.FC<PinInputProps> = ({
@@ -17,6 +18,7 @@ export const PinInput: React.FC<PinInputProps> = ({
   onChange,
   onComplete,
   disabled = false,
+  onAttemptWhenDisabled,
 }) => {
   const inputsRef = useRef<(HTMLInputElement | null)[]>([]);
 
@@ -78,7 +80,14 @@ export const PinInput: React.FC<PinInputProps> = ({
   };
 
   return (
-    <div className="flex items-center justify-center gap-2 sm:gap-3 my-4">
+    <div 
+      className="flex items-center justify-center gap-2 sm:gap-3 my-4 relative"
+      onClick={() => {
+        if (disabled && onAttemptWhenDisabled) {
+          onAttemptWhenDisabled();
+        }
+      }}
+    >
       {[0, 1, 2, 3, 4, 5].map((index) => {
         const char = digits[index] && digits[index] !== ' ' ? digits[index] : '';
         return (
@@ -94,16 +103,28 @@ export const PinInput: React.FC<PinInputProps> = ({
             maxLength={1}
             value={char}
             disabled={disabled}
+            onClick={(e) => {
+              if (disabled && onAttemptWhenDisabled) {
+                e.stopPropagation();
+                onAttemptWhenDisabled();
+              }
+            }}
             onChange={(e) => handleChange(index, e)}
-            onKeyDown={(e) => handleKeyDown(index, e)}
+            onKeyDown={(e) => {
+              if (disabled && onAttemptWhenDisabled) {
+                onAttemptWhenDisabled();
+                return;
+              }
+              handleKeyDown(index, e);
+            }}
             onPaste={handlePaste}
             className={`w-11 h-14 sm:w-14 sm:h-16 text-center text-2xl sm:text-3xl font-mono font-bold rounded-xl border transition-all duration-200 outline-none
               ${
                 char
-                  ? 'border-teal-500/80 bg-teal-500/5 text-teal-600 dark:text-teal-400 shadow-[0_0_12px_rgba(0,245,212,0.15)]'
-                  : 'border-neutral-300 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-900/80 text-neutral-900 dark:text-neutral-100'
+                  ? 'border-neutral-900 bg-neutral-50 text-neutral-900 dark:border-teal-500/80 dark:bg-teal-500/5 dark:text-teal-400'
+                  : 'border-neutral-300 dark:border-neutral-800 bg-white dark:bg-neutral-900/80 text-neutral-900 dark:text-neutral-100'
               }
-              focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 focus:scale-[1.03]
+              focus:border-neutral-900 dark:focus:border-teal-500 focus:ring-2 focus:ring-neutral-900/10 dark:focus:ring-teal-500/20 focus:scale-[1.02]
               disabled:opacity-50 disabled:cursor-not-allowed
             `}
           />

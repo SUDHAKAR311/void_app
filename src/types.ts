@@ -9,6 +9,8 @@ export type AppView = 'choice' | 'send' | 'receive' | 'transfer';
 
 export type VoidRole = 'sender' | 'receiver';
 
+export type DistributionMode = 'p2p' | 'broadcast';
+
 export type VoidStatus = 
   | 'idle' 
   | 'preparing' 
@@ -19,6 +21,12 @@ export type VoidStatus =
   | 'verifying' 
   | 'completed' 
   | 'error';
+
+export interface FileItemManifest {
+  name: string;
+  size: number;
+  type: string;
+}
 
 export interface TransferMetadata {
   id: string;
@@ -34,6 +42,10 @@ export interface TransferMetadata {
   salt: string; // Base64 encoded PBKDF2 salt
   iv: string;   // Base64 encoded starting IV
   timestamp: number;
+  distributionMode?: DistributionMode;
+  isMultiFile?: boolean;
+  fileCount?: number;
+  fileManifest?: FileItemManifest[];
 }
 
 export interface TransferProgress {

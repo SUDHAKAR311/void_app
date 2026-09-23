@@ -4,8 +4,11 @@
  */
 
 import { io, Socket } from 'socket.io-client';
+import JSZip from 'jszip';
 import { 
   ConnectionMode, 
+  DistributionMode,
+  FileItemManifest,
   TransferMetadata, 
   TransferProgress, 
   VoidRole, 
@@ -22,6 +25,7 @@ import {
   generateSalt, 
   getChunkIV 
 } from './crypto';
+import { wakeLockManager } from '../utils/wakeLockManager';
 
 export interface TransferManagerCallbacks {
   onStatusChange: (status: VoidStatus) => void;
@@ -30,15 +34,12 @@ export interface TransferManagerCallbacks {
   onMetadataReceived?: (metadata: TransferMetadata) => void;
   onReceiverReady?: () => void;
   onTextReceived?: (text: string) => void;
-  onError: (message: string) => void;
+  onError: (message: string, isLocked?: boolean, remainingSeconds?: number, warning?: string) => void;
   onFileReadyToDownload?: (blob: Blob, filename: string) => void;
+  onMultiFilesReady?: (files: Array<{ name: string; blob: Blob; size: number }>, zipBlob: Blob) => void;
 }
 
-// Optimized WebRTC SCTP Chunk Slices:
-// WebRTC RTCDataChannel SCTP MTU limit across all modern browsers (Chrome, Firefox, Safari iOS/macOS) is 64KB (65,536 bytes).
-// Encrypted packet: rawChunk (60KB) + AES-GCM tag (16B) + header (8B) = 61,464 bytes (< 65,536 bytes).
-// Fits in a single SCTP frame with zero fragmentation, preventing dropped packets, channel aborts, and bufferbloat.
-const CHUNK_SIZE_FILE = 60 * 1024;  // 60KB optimal single-packet frame for videos & large files
+const CHUNK_SIZE_FILE = 60 * 1024;  // 60KB optimal single-packet frame
 const CHUNK_SIZE_TEXT = 32 * 1024;  // 32KB for clipboard text
 const DEFAULT_CHUNK_SIZE = CHUNK_SIZE_FILE;
 
@@ -48,12 +49,6 @@ interface PrefetchedChunk {
   isLast: boolean;
 }
 
-/**
- * Aggressive Read-Ahead Pipeline Buffer:
- * Decouples disk reading (File.slice) and Web Crypto AES-256-GCM hardware encryption from network I/O.
- * Continuously pre-slices and pre-encrypts chunks ahead of the transmission loop with multi-worker concurrency,
- * completely eliminating disk latency and saturating available network bandwidth for large video files.
- */
 class ReadAheadBuffer {
   private readyChunks: Map<number, PrefetchedChunk> = new Map();
   private waitResolvers: Map<number, (chunk: PrefetchedChunk) => void> = new Map();
@@ -64,15 +59,15 @@ class ReadAheadBuffer {
   private inFlightTasks = 0;
 
   constructor(
-    private fileRef: File | null,
+    private fileRef: File | Blob | null,
     private preparedBuffer: ArrayBuffer | null,
     private cryptoKey: CryptoKey,
     private baseIV: Uint8Array,
     private chunkSize: number,
     private totalBytes: number,
     private chunkCount: number,
-    private bufferCapacity = 32, // Deep pre-encrypted buffer in memory (~8 MB RAM)
-    private concurrency = 6     // 6 concurrent hardware Web Crypto AES-NI worker tasks
+    private bufferCapacity = 32,
+    private concurrency = 6
   ) {}
 
   public start() {
@@ -186,6 +181,7 @@ export class TransferManager {
   private socket: Socket;
   private role: VoidRole;
   private code: string = '';
+  private distributionMode: DistributionMode = 'p2p';
   private partnerSocketId: string = '';
   private peerConnection: RTCPeerConnection | null = null;
   private dataChannel: RTCDataChannel | null = null;
@@ -195,19 +191,15 @@ export class TransferManager {
   private salt: Uint8Array = new Uint8Array();
   private metadata: TransferMetadata | null = null;
 
-  // Queued chunks in case network packets arrive while PBKDF2 key is deriving
+  // Queued chunks for receiver before key is derived
   private pendingChunksQueue: Array<{ index: number; total: number; chunk: any; isLast?: boolean }> = [];
-  private isKeyDeriving = false;
   private isWaitingForRemainingChunks = false;
 
   private isTransferring = false;
-  private wakeLockSentinel: any = null;
   private callbacks: TransferManagerCallbacks;
 
   // Flow control & sliding window
   private inFlightIndices = new Set<number>();
-  private readonly MAX_WINDOW_WEBRTC = 160; // 160 unacknowledged chunks (~9.6 MB) saturates local Wi-Fi / gigabit P2P
-  private readonly MAX_WINDOW_SOCKET = 32;  // 32 unacknowledged chunks (~1.9 MB) for socket relay
   private ackResolvers: Array<() => void> = [];
   private completionResolver: (() => void) | null = null;
   private isFinalizing = false;
@@ -230,11 +222,11 @@ export class TransferManager {
 
   // Receiver stream assembly
   private receivedChunksMap = new Map<number, Uint8Array>();
-  private fileWritableStream: any = null; // FileSystemWritableFileStream if supported
 
   // Cached prepared sender payload
   private preparedBuffer: ArrayBuffer | null = null;
-  private fileRef: File | null = null;
+  private fileRef: File | Blob | null = null;
+  private rawFilesList: File[] = [];
 
   constructor(role: VoidRole, callbacks: TransferManagerCallbacks) {
     this.role = role;
@@ -255,92 +247,48 @@ export class TransferManager {
     this.code = code;
   }
 
-  public getCode(): string {
-    return this.code;
+  public setDistributionMode(mode: DistributionMode) {
+    this.distributionMode = mode;
+  }
+
+  public getDistributionMode(): DistributionMode {
+    return this.distributionMode;
   }
 
   public getMetadata(): TransferMetadata | null {
     return this.metadata;
   }
 
-  public isConnected(): boolean {
-    return this.socket.connected;
-  }
-
-  // --- Flow Control Helpers ---
-  private handleAck(index: number, receivedBytes?: number) {
-    for (const inflight of Array.from(this.inFlightIndices)) {
-      if (inflight <= index) {
-        this.inFlightIndices.delete(inflight);
-      }
-    }
-
-    // Synchronize sender progress strictly with confirmed receiver delivery
-    if (this.role === 'sender') {
-      if (typeof receivedBytes === 'number' && receivedBytes > 0) {
-        this.bytesTransferred = Math.min(this.totalBytes, Math.max(this.bytesTransferred, receivedBytes));
-      } else {
-        const chunkSize = this.metadata?.chunkSize || this.activeChunkSize || DEFAULT_CHUNK_SIZE;
-        const estimated = Math.min((index + 1) * chunkSize, this.totalBytes);
-        this.bytesTransferred = Math.min(this.totalBytes, Math.max(this.bytesTransferred, estimated));
-      }
-      this.updateProgress();
-    }
-
-    const maxWindow = this.connectionMode === 'p2p-direct' ? this.MAX_WINDOW_WEBRTC : this.MAX_WINDOW_SOCKET;
-    while (this.inFlightIndices.size < maxWindow && this.ackResolvers.length > 0) {
-      const resolve = this.ackResolvers.shift();
-      resolve?.();
-    }
-  }
-
-  private async waitForAckWindow() {
-    const maxWindow = this.connectionMode === 'p2p-direct' ? this.MAX_WINDOW_WEBRTC : this.MAX_WINDOW_SOCKET;
-    if (this.inFlightIndices.size < maxWindow) return;
-    await new Promise<void>((resolve) => {
-      this.ackResolvers.push(resolve);
-      // Balanced flow control timeout (2500ms) gives receiver time to decrypt without stalling if an ACK drops
-      setTimeout(() => {
-        resolve();
-      }, 2500);
-    });
-  }
-
-  // --- Socket.io Signaling & Handshake ---
+  // --- Socket.IO Event Handlers ---
   private setupSocketListeners() {
-    this.socket.on('connect', () => {
-      // Socket connected
-    });
-
-    this.socket.on('void-created', ({ code }: { code: string }) => {
-      this.code = code;
-      this.callbacks.onStatusChange('waiting');
-    });
-
-    this.socket.on('partner-joined', async ({ partnerId }: { partnerId: string }) => {
+    this.socket.on('partner-joined', async ({ partnerId, code, mode }: { partnerId: string; code: string; mode?: DistributionMode }) => {
       this.partnerSocketId = partnerId;
+      if (mode) this.distributionMode = mode;
       this.callbacks.onPartnerJoined?.();
-      // Sender starts WebRTC offer
-      await this.initiateWebRTCConnection(true);
 
-      // If sender has already prepared metadata, broadcast it to receiver
-      if (this.metadata) {
-        this.broadcastMetadata(this.metadata);
+      // In 1-to-1 P2P mode, initiate WebRTC connection
+      if (this.distributionMode === 'p2p') {
+        await this.initiateWebRTCAsSender();
+      } else {
+        // In broadcast mode, use high-speed socket relay pipe with cached memory chunks
+        this.connectionMode = 'socket-pipe';
+        this.networkRoute = 'relay-server';
+        this.updateProgress();
       }
     });
 
-    this.socket.on('partner-found', async ({ partnerId }: { partnerId: string }) => {
+    this.socket.on('partner-found', async ({ partnerId, code, mode }: { partnerId: string; code: string; mode?: DistributionMode }) => {
       this.partnerSocketId = partnerId;
-      // Receiver waits for WebRTC offer or sets up answer
-      await this.initiateWebRTCConnection(false);
+      if (mode) this.distributionMode = mode;
 
-      // Ask sender for metadata if ready
-      this.socket.emit('relay-request-metadata', { to: partnerId });
-    });
-
-    this.socket.on('relay-request-metadata', () => {
-      if (this.metadata) {
-        this.broadcastMetadata(this.metadata);
+      if (this.distributionMode === 'p2p') {
+        await this.initiateWebRTCAsReceiver();
+      } else {
+        this.connectionMode = 'socket-pipe';
+        this.networkRoute = 'relay-server';
+        this.updateProgress();
+        // Request the broadcast stream if already published
+        this.socket.emit('request-broadcast-stream', { code: this.code });
       }
     });
 
@@ -348,12 +296,12 @@ export class TransferManager {
       await this.handleIncomingSignal(from, signal);
     });
 
-    // Receiver notified that metadata arrived via socket fallback
+    // Receiver notified that metadata arrived
     this.socket.on('relay-metadata', async ({ metadata }: { metadata: TransferMetadata }) => {
       await this.processIncomingMetadata(metadata);
     });
 
-    // Receiver tells sender: "I am ready to receive the stream!"
+    // Receiver tells sender: "Ready to receive stream!"
     this.socket.on('relay-ready-to-receive', () => {
       this.callbacks.onReceiverReady?.();
       this.startStreamingChunks();
@@ -384,25 +332,24 @@ export class TransferManager {
       }
     });
 
-    this.socket.on('void-error', ({ message }: { message: string }) => {
-      this.callbacks.onError(message);
+    this.socket.on('void-error', (data: { message: string; warning?: string; isLocked?: boolean; remainingSeconds?: number }) => {
+      this.callbacks.onError(data.message, data.isLocked, data.remainingSeconds, data.warning);
     });
 
     this.socket.on('partner-disconnected', ({ message }: { message: string }) => {
-      // If WebRTC is actively connected and functioning, do NOT terminate the transfer!
-      // WebRTC is peer-to-peer and completely independent of the signaling socket.
       if (this.connectionMode === 'p2p-direct' && this.dataChannel && this.dataChannel.readyState === 'open') {
-        console.info('[void] Signaling socket disconnected, but P2P WebRTC DataChannel remains open and active.');
         return;
       }
-
+      if (this.distributionMode === 'broadcast') {
+        return; // Don't terminate broadcast session on peer disconnect
+      }
       if (this.isTransferring && !this.isFinalizing && this.receivedChunksMap.size < (this.metadata?.chunkCount || 0)) {
         this.callbacks.onError(message || 'Peer closed the tab. Session terminated.');
       }
     });
   }
 
-  // --- WebRTC Signaling & Candidate Synchronization ---
+  // --- WebRTC Signaling ---
   private async handleIncomingSignal(from: string, signal: any) {
     if (!this.peerConnection) {
       this.earlySignals.push({ from, signal });
@@ -413,7 +360,6 @@ export class TransferManager {
       if (signal.sdp) {
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
 
-        // Immediately drain queued ICE candidates that arrived before remote description was ready
         if (this.pendingCandidates.length > 0) {
           const queued = [...this.pendingCandidates];
           this.pendingCandidates = [];
@@ -442,33 +388,37 @@ export class TransferManager {
         }
       }
     } catch (err) {
-      console.warn('[void] WebRTC signaling notice:', err);
+      console.warn('[void] Signal processing fallback:', err);
     }
   }
 
-  // --- WebRTC Connection with Fallback Racing ---
-  private async initiateWebRTCConnection(isInitiator: boolean) {
+  private async getIceServers(): Promise<RTCIceServer[]> {
     try {
-      const iceServers: RTCIceServer[] = [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: 'stun:global.stun.twilio.com:3478' },
-      ];
+      const res = await fetch('/api/ice-servers');
+      if (res.ok) {
+        const data = await res.json();
+        return data.iceServers;
+      }
+    } catch {
+      // Fallback
+    }
+    return [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+    ];
+  }
 
+  private async initiateWebRTCAsSender() {
+    try {
+      const iceServers = await this.getIceServers();
       this.peerConnection = new RTCPeerConnection({ iceServers });
 
-      // Drain early signals if any arrived while peer connection was instantiating
-      if (this.earlySignals.length > 0) {
-        const queuedSignals = [...this.earlySignals];
-        this.earlySignals = [];
-        for (const item of queuedSignals) {
-          await this.handleIncomingSignal(item.from, item.signal);
-        }
-      }
+      this.dataChannel = this.peerConnection.createDataChannel('void-stream', {
+        ordered: false, // Eliminates Head-of-Line blocking over Wi-Fi
+      });
+      this.dataChannel.binaryType = 'arraybuffer';
+      this.setupDataChannelEvents();
 
       this.peerConnection.onicecandidate = (event) => {
         if (event.candidate && this.partnerSocketId) {
@@ -478,28 +428,6 @@ export class TransferManager {
           });
         }
       };
-
-      if (isInitiator) {
-        // ordered: false eliminates SCTP Head-of-Line blocking over Wi-Fi jitter while maintaining 100% reliability
-        this.dataChannel = this.peerConnection.createDataChannel('void-stream', {
-          ordered: false,
-        });
-        this.dataChannel.binaryType = 'arraybuffer';
-        this.setupDataChannelEvents();
-
-        const offer = await this.peerConnection.createOffer();
-        await this.peerConnection.setLocalDescription(offer);
-        this.socket.emit('signal', {
-          to: this.partnerSocketId,
-          signal: { sdp: this.peerConnection.localDescription },
-        });
-      } else {
-        this.peerConnection.ondatachannel = (event) => {
-          this.dataChannel = event.channel;
-          this.dataChannel.binaryType = 'arraybuffer';
-          this.setupDataChannelEvents();
-        };
-      }
 
       this.peerConnection.onconnectionstatechange = async () => {
         if (this.peerConnection?.connectionState === 'connected') {
@@ -516,30 +444,78 @@ export class TransferManager {
         }
       };
 
-      // 4.5s watchdog fallback: if WebRTC takes longer than 4.5s, transparently use socket-pipe
-      setTimeout(() => {
-        if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-          this.connectionMode = 'socket-pipe';
-          this.updateProgress();
-        }
-      }, 4500);
+      const offer = await this.peerConnection.createOffer();
+      await this.peerConnection.setLocalDescription(offer);
+
+      this.socket.emit('signal', {
+        to: this.partnerSocketId,
+        signal: { sdp: this.peerConnection.localDescription },
+      });
+
+      // Process any early signals
+      for (const early of this.earlySignals) {
+        await this.handleIncomingSignal(early.from, early.signal);
+      }
+      this.earlySignals = [];
     } catch (err) {
       console.warn('[void] WebRTC initialization notice:', err);
       this.connectionMode = 'socket-pipe';
     }
   }
 
+  private async initiateWebRTCAsReceiver() {
+    try {
+      const iceServers = await this.getIceServers();
+      this.peerConnection = new RTCPeerConnection({ iceServers });
+
+      this.peerConnection.onicecandidate = (event) => {
+        if (event.candidate && this.partnerSocketId) {
+          this.socket.emit('signal', {
+            to: this.partnerSocketId,
+            signal: { candidate: event.candidate },
+          });
+        }
+      };
+
+      this.peerConnection.ondatachannel = (event) => {
+        this.dataChannel = event.channel;
+        this.dataChannel.binaryType = 'arraybuffer';
+        this.setupDataChannelEvents();
+      };
+
+      this.peerConnection.onconnectionstatechange = async () => {
+        if (this.peerConnection?.connectionState === 'connected') {
+          this.connectionMode = 'p2p-direct';
+          await this.updateNetworkRoute();
+          this.updateProgress();
+        } else if (
+          this.peerConnection?.connectionState === 'failed' ||
+          this.peerConnection?.connectionState === 'disconnected'
+        ) {
+          this.connectionMode = 'socket-pipe';
+          this.networkRoute = 'relay-server';
+          this.updateProgress();
+        }
+      };
+
+      for (const early of this.earlySignals) {
+        await this.handleIncomingSignal(early.from, early.signal);
+      }
+      this.earlySignals = [];
+    } catch (err) {
+      console.warn('[void] WebRTC receiver notice:', err);
+      this.connectionMode = 'socket-pipe';
+    }
+  }
+
   private setupDataChannelEvents() {
     if (!this.dataChannel) return;
-
-    // High throughput: set 1 MB low-water mark for hardware SCTP flow backpressure
     this.dataChannel.bufferedAmountLowThreshold = 1024 * 1024;
 
     this.dataChannel.onopen = () => {
       this.connectionMode = 'p2p-direct';
       this.updateProgress();
 
-      // Send metadata over data channel if available
       if (this.role === 'sender' && this.metadata && this.dataChannel) {
         this.dataChannel.send(JSON.stringify({ type: 'metadata', metadata: this.metadata }));
       }
@@ -570,16 +546,11 @@ export class TransferManager {
               this.completionResolver = null;
             }
           }
-        } catch {
-          // ignore
-        }
+        } catch {}
       } else if (event.data instanceof ArrayBuffer) {
-        // Binary encrypted chunk payload:
-        // Format: [4 bytes chunkIndex] [4 bytes totalChunks] [rest = encrypted data]
         const view = new DataView(event.data);
         const chunkIndex = view.getUint32(0, false);
         const totalChunks = view.getUint32(4, false);
-        // Zero-copy typed array view avoids allocating an extra copy in memory
         const encryptedData = new Uint8Array(event.data, 8);
         const isLast = chunkIndex === totalChunks - 1;
         await this.handleIncomingChunk(chunkIndex, totalChunks, encryptedData, isLast);
@@ -594,22 +565,33 @@ export class TransferManager {
     };
 
     this.dataChannel.onerror = () => {
-      // Seamlessly switch to socket-pipe fallback
       this.connectionMode = 'socket-pipe';
       this.updateProgress();
     };
   }
 
-  // --- Sender Methods ---
-  public async preparePayload(payload: { file?: File | null; text?: string }): Promise<TransferMetadata> {
+  // --- Sender Methods (Single File, Multi-File, or Text) ---
+  public async preparePayload(payload: { 
+    file?: File | null; 
+    files?: File[]; 
+    text?: string;
+    distributionMode?: DistributionMode;
+  }): Promise<TransferMetadata> {
     this.salt = generateSalt();
     this.baseIV = generateBaseIV();
     this.cryptoKey = await deriveKeyFromCode(this.code, this.salt);
+    if (payload.distributionMode) {
+      this.distributionMode = payload.distributionMode;
+    }
 
     let name = '';
     let type = '';
     let isText = false;
+    let isMultiFile = false;
+    let fileManifest: FileItemManifest[] = [];
     let textContent = '';
+
+    const multipleFiles = payload.files && payload.files.length > 1 ? payload.files : null;
 
     if (payload.text !== undefined && payload.text.trim().length > 0) {
       isText = true;
@@ -619,31 +601,54 @@ export class TransferManager {
       this.preparedBuffer = new TextEncoder().encode(payload.text).buffer;
       this.fileRef = null;
       this.totalBytes = this.preparedBuffer.byteLength;
-    } else if (payload.file) {
-      name = payload.file.name;
-      type = payload.file.type || 'application/octet-stream';
-      this.fileRef = payload.file;
+    } else if (multipleFiles && multipleFiles.length > 1) {
+      // MULTI-FILE ARCHIVE PACKAGING:
+      // Packages files into an optimized zip container with zero compression (STORE mode)
+      // for instant streaming without CPU lag.
+      isMultiFile = true;
+      name = `void-archive-${multipleFiles.length}-files.zip`;
+      type = 'application/zip';
+      this.rawFilesList = multipleFiles;
+
+      fileManifest = multipleFiles.map(f => ({
+        name: f.name,
+        size: f.size,
+        type: f.type || 'application/octet-stream',
+      }));
+
+      const zip = new JSZip();
+      for (const f of multipleFiles) {
+        zip.file(f.name, f);
+      }
+      const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+      this.fileRef = zipBlob;
       this.preparedBuffer = null;
-      this.totalBytes = payload.file.size;
+      this.totalBytes = zipBlob.size;
+    } else if (payload.file || (payload.files && payload.files.length === 1)) {
+      const single = payload.file || payload.files![0];
+      name = single.name;
+      type = single.type || 'application/octet-stream';
+      this.fileRef = single;
+      this.preparedBuffer = null;
+      this.totalBytes = single.size;
     } else {
-      throw new Error('No file or text payload selected.');
+      throw new Error('No files or text payload selected.');
     }
 
     this.bytesTransferred = 0;
 
-    // Calculate SHA-256 fingerprint safely (without out-of-memory on large videos)
+    // Fast SHA-256 fingerprint
     let sha256Fingerprint = '';
     if (isText && this.preparedBuffer) {
       sha256Fingerprint = await computeSHA256(this.preparedBuffer);
-    } else if (payload.file) {
-      if (payload.file.size <= 16 * 1024 * 1024) {
-        const buf = await payload.file.arrayBuffer();
+    } else if (this.fileRef) {
+      if (this.fileRef.size <= 16 * 1024 * 1024) {
+        const buf = await this.fileRef.arrayBuffer();
         sha256Fingerprint = await computeSHA256(buf);
       } else {
-        // Fast sample fingerprint for large files/videos without loading full file into memory
-        const head = await payload.file.slice(0, 1024 * 1024).arrayBuffer();
-        const tail = await payload.file.slice(Math.max(0, payload.file.size - 1024 * 1024)).arrayBuffer();
-        const metaBytes = new TextEncoder().encode(`${payload.file.name}-${payload.file.size}`);
+        const head = await this.fileRef.slice(0, 1024 * 1024).arrayBuffer();
+        const tail = await this.fileRef.slice(Math.max(0, this.fileRef.size - 1024 * 1024)).arrayBuffer();
+        const metaBytes = new TextEncoder().encode(`${name}-${this.fileRef.size}`);
         const sample = new Uint8Array(head.byteLength + tail.byteLength + metaBytes.byteLength);
         sample.set(new Uint8Array(head), 0);
         sample.set(new Uint8Array(tail), head.byteLength);
@@ -652,8 +657,7 @@ export class TransferManager {
       }
     }
 
-    // Dynamic Chunk Sizing: 60KB for files/videos (optimal WebRTC SCTP single-frame MTU), 32KB for text
-    this.activeChunkSize = (payload.file || this.totalBytes >= 1024 * 1024)
+    this.activeChunkSize = (this.fileRef || this.totalBytes >= 1024 * 1024)
       ? CHUNK_SIZE_FILE
       : CHUNK_SIZE_TEXT;
 
@@ -673,25 +677,72 @@ export class TransferManager {
       salt: bufferToBase64(this.salt),
       iv: bufferToBase64(this.baseIV),
       timestamp: Date.now(),
+      distributionMode: this.distributionMode,
+      isMultiFile,
+      fileCount: multipleFiles ? multipleFiles.length : 1,
+      fileManifest: isMultiFile ? fileManifest : undefined,
     };
 
     this.metadata = metadata;
 
-    // If receiver is already connected, broadcast metadata immediately
-    if (this.partnerSocketId) {
+    // In Broadcast Mode, cache metadata on the server immediately
+    if (this.distributionMode === 'broadcast') {
+      this.socket.emit('cache-broadcast-metadata', {
+        code: this.code,
+        metadata,
+      });
+      // Start caching all encrypted chunks in RAM so receivers can pull instantly with zero sender lag
+      this.precacheBroadcastChunks(metadata);
+    } else if (this.partnerSocketId) {
       this.broadcastMetadata(metadata);
     }
 
     return metadata;
   }
 
+  // Pre-caches encrypted chunks on the server in broadcast mode so any number of receivers can retrieve concurrently
+  private async precacheBroadcastChunks(metadata: TransferMetadata) {
+    if (!this.cryptoKey || (!this.fileRef && !this.preparedBuffer)) return;
+
+    try {
+      const chunkCount = metadata.chunkCount;
+      const readAhead = new ReadAheadBuffer(
+        this.fileRef,
+        this.preparedBuffer,
+        this.cryptoKey,
+        this.baseIV,
+        this.activeChunkSize,
+        this.totalBytes,
+        chunkCount,
+        64,
+        6
+      );
+      readAhead.start();
+
+      for (let i = 0; i < chunkCount; i++) {
+        const prefetched = await readAhead.getChunk(i);
+        this.socket.emit('cache-broadcast-chunk', {
+          code: this.code,
+          index: i,
+          total: chunkCount,
+          chunk: prefetched.encryptedBuffer,
+          isLast: i === chunkCount - 1,
+        });
+        if (i % 24 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+      readAhead.abort();
+    } catch (err) {
+      console.warn('[void] Broadcast pre-cache error:', err);
+    }
+  }
+
   public broadcastMetadata(metadata: TransferMetadata) {
     if (this.dataChannel && this.dataChannel.readyState === 'open') {
       try {
         this.dataChannel.send(JSON.stringify({ type: 'metadata', metadata }));
-      } catch {
-        // Fallback to socket
-      }
+      } catch {}
     }
 
     if (this.partnerSocketId) {
@@ -704,7 +755,7 @@ export class TransferManager {
 
   public async startStreamingChunks() {
     if ((!this.preparedBuffer && !this.fileRef) || !this.metadata || !this.cryptoKey) return;
-    if (this.isTransferring) return; // Prevent double trigger
+    if (this.isTransferring) return;
 
     try {
       this.acquireWakeLock();
@@ -718,9 +769,6 @@ export class TransferManager {
 
       const chunkCount = this.metadata.chunkCount;
 
-      // Launch the Aggressive Read-Ahead Pipeline:
-      // Concurrently pre-slices from disk and hardware-encrypts up to 128 chunks in parallel (~7.7 MB RAM buffer),
-      // completely removing disk and crypto wait times from the transmission loop to saturate network bandwidth.
       const readAhead = new ReadAheadBuffer(
         this.fileRef,
         this.preparedBuffer,
@@ -729,8 +777,8 @@ export class TransferManager {
         this.activeChunkSize,
         this.totalBytes,
         chunkCount,
-        128, // 128 chunks pipeline capacity (~7.7 MB in memory)
-        8   // 8 concurrent hardware Web Crypto AES-NI worker tasks
+        128,
+        8
       );
       this.readAheadBuffer = readAhead;
       readAhead.start();
@@ -738,19 +786,15 @@ export class TransferManager {
       for (let i = 0; i < chunkCount; i++) {
         if (!this.isTransferring) break;
 
-        // Flow control: wait if window is full
         await this.waitForAckWindow();
         this.inFlightIndices.add(i);
 
-        // Instantly obtain the pre-encrypted chunk from the read-ahead buffer
         const prefetched = await readAhead.getChunk(i);
         const encryptedChunk = prefetched.encryptedBuffer;
 
-        // Send through WebRTC or Socket Pipe
         let sentViaWebRTC = false;
         if (this.dataChannel && this.dataChannel.readyState === 'open') {
           try {
-            // Hardware backpressure: wait only if SCTP buffer exceeds high-water mark (8MB)
             if (this.dataChannel.bufferedAmount > 8 * 1024 * 1024) {
               await new Promise<void>((resolve) => {
                 if (!this.dataChannel || this.dataChannel.readyState !== 'open') return resolve();
@@ -759,7 +803,6 @@ export class TransferManager {
                   resolve();
                 };
                 this.dataChannel.addEventListener('bufferedamountlow', onLow, { once: true });
-                // Fallback watchdog in case event already fired
                 setTimeout(onLow, 50);
               });
             }
@@ -773,13 +816,11 @@ export class TransferManager {
             this.dataChannel.send(packet.buffer);
             sentViaWebRTC = true;
           } catch (err) {
-            console.warn('[void] WebRTC channel send failed, switching to socket pipe:', err);
             this.connectionMode = 'socket-pipe';
           }
         }
 
         if (!sentViaWebRTC) {
-          // Socket Pipe fallback
           this.socket.emit('relay-chunk', {
             to: this.partnerSocketId,
             index: i,
@@ -788,18 +829,15 @@ export class TransferManager {
             isLast: i === chunkCount - 1,
           });
 
-          // Cooperative UI yield every 16 chunks to keep event loop and UI completely smooth
           if (i % 16 === 0) {
             await new Promise((r) => setTimeout(r, 0));
           }
         }
       }
 
-      // Free read-ahead buffer memory once streaming completes
       readAhead.abort();
       this.readAheadBuffer = null;
 
-      // Notify completion
       if (this.dataChannel && this.dataChannel.readyState === 'open') {
         try {
           this.dataChannel.send(JSON.stringify({ type: 'complete' }));
@@ -808,12 +846,9 @@ export class TransferManager {
         this.socket.emit('relay-complete', { to: this.partnerSocketId });
       }
 
-      // Await receiver completion handshake (synchronized finish) with 30s fallback
       await new Promise<void>((resolve) => {
         this.completionResolver = resolve;
-        setTimeout(() => {
-          resolve();
-        }, 30000);
+        setTimeout(() => resolve(), 30000);
       });
 
       this.bytesTransferred = this.totalBytes;
@@ -836,17 +871,15 @@ export class TransferManager {
     this.totalBytes = metadata.totalBytes;
     this.salt = base64ToBuffer(metadata.salt);
     this.baseIV = base64ToBuffer(metadata.iv);
-
-    this.isKeyDeriving = true;
-    try {
-      this.cryptoKey = await deriveKeyFromCode(this.code, this.salt);
-    } finally {
-      this.isKeyDeriving = false;
+    if (metadata.distributionMode) {
+      this.distributionMode = metadata.distributionMode;
     }
+
+    this.cryptoKey = await deriveKeyFromCode(this.code, this.salt);
 
     this.callbacks.onMetadataReceived?.(metadata);
 
-    // Drain any pending chunks that were buffered before key derived
+    // Drain queued chunks
     if (this.pendingChunksQueue.length > 0) {
       const queue = [...this.pendingChunksQueue];
       this.pendingChunksQueue = [];
@@ -864,13 +897,17 @@ export class TransferManager {
     this.isFinalizing = false;
     this.callbacks.onStatusChange('transferring');
 
-    // Notify sender to begin streaming chunks
-    if (this.dataChannel && this.dataChannel.readyState === 'open') {
-      try {
-        this.dataChannel.send(JSON.stringify({ type: 'ready-to-receive' }));
-      } catch {}
-    } else if (this.partnerSocketId) {
-      this.socket.emit('relay-ready-to-receive', { to: this.partnerSocketId });
+    if (this.distributionMode === 'broadcast') {
+      // In broadcast mode, request stream immediately
+      this.socket.emit('request-broadcast-stream', { code: this.code });
+    } else {
+      if (this.dataChannel && this.dataChannel.readyState === 'open') {
+        try {
+          this.dataChannel.send(JSON.stringify({ type: 'ready-to-receive' }));
+        } catch {}
+      } else if (this.partnerSocketId) {
+        this.socket.emit('relay-ready-to-receive', { to: this.partnerSocketId });
+      }
     }
   }
 
@@ -880,18 +917,15 @@ export class TransferManager {
     encryptedChunk: any,
     isLast?: boolean
   ) {
-    // If PBKDF2 key is still deriving, buffer chunk
     if (!this.cryptoKey) {
       this.pendingChunksQueue.push({ index, total, chunk: encryptedChunk, isLast });
       return;
     }
 
-    // Deduplicate chunk if already processed
     if (this.receivedChunksMap.has(index)) {
       return;
     }
 
-    // Normalize chunk across Socket.io & WebRTC formats safely (zero-copy when already ArrayBuffer or View)
     let chunkPayload: any = null;
     if (encryptedChunk instanceof ArrayBuffer || ArrayBuffer.isView(encryptedChunk)) {
       chunkPayload = encryptedChunk;
@@ -915,7 +949,6 @@ export class TransferManager {
     const chunkIV = getChunkIV(this.baseIV, index);
 
     try {
-      // AES-256-GCM Decryption with hardware tamper authentication tag check
       const decrypted = await decryptChunk(this.cryptoKey, chunkIV, chunkPayload);
       const decryptedBytes = new Uint8Array(decrypted);
 
@@ -923,8 +956,6 @@ export class TransferManager {
       this.bytesTransferred += decrypted.byteLength;
       this.updateProgress();
 
-      // Flow control acknowledgment: send ACK every 16 chunks or on last chunk
-      // (Reduces reverse channel traffic by 75% while keeping sender and receiver tightly synchronized)
       if (index % 16 === 0 || isLast || index === total - 1) {
         if (this.dataChannel && this.dataChannel.readyState === 'open') {
           try {
@@ -944,14 +975,13 @@ export class TransferManager {
         }
       }
 
-      // Check if all chunks have arrived
       if (this.receivedChunksMap.size === total || (this.isWaitingForRemainingChunks && this.receivedChunksMap.size === total)) {
         await this.finalizeTransfer();
       }
     } catch (err: any) {
       this.isTransferring = false;
       this.callbacks.onError(
-        err.message || 'INTEGRITY_BREACH: Authentication tag verification failed. Transfer halted.'
+        err.message || 'Authentication tag verification failed. Transfer halted.'
       );
       this.releaseWakeLock();
     }
@@ -963,7 +993,6 @@ export class TransferManager {
     this.callbacks.onStatusChange('verifying');
 
     try {
-      // Reconstruct file/text if stored in memory
       if (this.receivedChunksMap.size > 0) {
         const sortedIndices = Array.from(this.receivedChunksMap.keys()).sort((a, b) => a - b);
         const totalExpected = this.metadata?.chunkCount || sortedIndices.length;
@@ -984,7 +1013,6 @@ export class TransferManager {
           this.receivedChunksMap.clear();
           this.callbacks.onTextReceived?.(text);
         } else if (this.metadata) {
-          // Zero-copy array reassembly preserving bit-for-bit file integrity
           const sortedChunks: Uint8Array[] = new Array(totalExpected);
           for (let i = 0; i < totalExpected; i++) {
             const chunk = this.receivedChunksMap.get(i);
@@ -994,7 +1022,6 @@ export class TransferManager {
             sortedChunks[i] = chunk;
           }
 
-          // Accurate MIME type resolution for seamless in-browser video playback and download
           let mime = this.metadata.type;
           if (!mime || mime === 'application/octet-stream') {
             const ext = this.metadata.name.split('.').pop()?.toLowerCase();
@@ -1003,39 +1030,46 @@ export class TransferManager {
             else if (ext === 'mov') mime = 'video/quicktime';
             else if (ext === 'mkv') mime = 'video/x-matroska';
             else if (ext === 'avi') mime = 'video/x-msvideo';
-            else if (ext === 'm4v') mime = 'video/mp4';
-            else if (ext === 'mp3') mime = 'audio/mpeg';
-            else if (ext === 'wav') mime = 'audio/wav';
             else if (ext === 'png') mime = 'image/png';
             else if (ext === 'jpg' || ext === 'jpeg') mime = 'image/jpeg';
             else if (ext === 'pdf') mime = 'application/pdf';
             else if (ext === 'zip') mime = 'application/zip';
           }
 
-          const blob = new Blob(sortedChunks as BlobPart[], { type: mime || 'application/octet-stream' });
-          // Free individual memory slices immediately
+          let blob: Blob;
+          try {
+            blob = new Blob(sortedChunks as BlobPart[], { type: mime || 'application/octet-stream' });
+          } catch (allocErr: any) {
+            this.receivedChunksMap.clear();
+            throw new Error(
+              `Insufficient device storage or browser memory to compile ${this.metadata.name}. Please ensure your device has sufficient free disk space and close unused applications.`
+            );
+          }
           this.receivedChunksMap.clear();
 
-          // Integrity verification
-          if (this.metadata.sha256Fingerprint) {
-            if (this.totalBytes <= 16 * 1024 * 1024) {
-              const fullBuf = await blob.arrayBuffer();
-              const computedHash = await computeSHA256(fullBuf);
-              if (computedHash !== this.metadata.sha256Fingerprint) {
-                console.warn('[void] SHA-256 fingerprint verification notice, AES-GCM tags verified.');
+          // MULTI-FILE ARCHIVE UNPACKING
+          // If this was a multi-file batch, unpack files individually so user can download each file separately or all at once
+          if (this.metadata.isMultiFile) {
+            try {
+              const zip = await JSZip.loadAsync(blob);
+              const unpackedFiles: Array<{ name: string; blob: Blob; size: number }> = [];
+
+              for (const [filename, fileEntry] of Object.entries(zip.files)) {
+                if (!fileEntry.dir) {
+                  const fileBlob = await fileEntry.async('blob');
+                  unpackedFiles.push({
+                    name: filename,
+                    blob: fileBlob,
+                    size: fileBlob.size,
+                  });
+                }
               }
-            } else {
-              const head = await blob.slice(0, 1024 * 1024).arrayBuffer();
-              const tail = await blob.slice(Math.max(0, blob.size - 1024 * 1024)).arrayBuffer();
-              const metaBytes = new TextEncoder().encode(`${this.metadata.name}-${blob.size}`);
-              const sample = new Uint8Array(head.byteLength + tail.byteLength + metaBytes.byteLength);
-              sample.set(new Uint8Array(head), 0);
-              sample.set(new Uint8Array(tail), head.byteLength);
-              sample.set(metaBytes, head.byteLength + tail.byteLength);
-              const computedHash = await computeSHA256(sample);
-              if (computedHash !== this.metadata.sha256Fingerprint) {
-                console.warn('[void] SHA-256 sample fingerprint verified.');
+
+              if (unpackedFiles.length > 0) {
+                this.callbacks.onMultiFilesReady?.(unpackedFiles, blob);
               }
+            } catch (zipErr) {
+              console.warn('[void] Multi-file unpack notice, delivering archive blob:', zipErr);
             }
           }
 
@@ -1043,7 +1077,6 @@ export class TransferManager {
         }
       }
 
-      // Signal completion back to sender so sender marks completed synchronously
       if (this.dataChannel && this.dataChannel.readyState === 'open') {
         try {
           this.dataChannel.send(JSON.stringify({ type: 'ack-complete' }));
@@ -1061,7 +1094,7 @@ export class TransferManager {
     }
   }
 
-  // --- Network Route Diagnostics (Local LAN vs Public WAN STUN vs Relay) ---
+  // --- Network Route Diagnostics ---
   private async updateNetworkRoute() {
     if (this.connectionMode === 'socket-pipe') {
       this.networkRoute = 'relay-server';
@@ -1087,12 +1120,34 @@ export class TransferManager {
           this.networkRoute = 'public-wan';
         }
       }
-    } catch {
-      // fallback
+    } catch {}
+  }
+
+  private handleAck(index: number, receivedBytes?: number) {
+    this.inFlightIndices.delete(index);
+    if (receivedBytes !== undefined && receivedBytes > this.bytesTransferred) {
+      this.bytesTransferred = receivedBytes;
+      this.updateProgress();
+    }
+
+    if (this.ackResolvers.length > 0) {
+      const resolver = this.ackResolvers.shift();
+      resolver?.();
     }
   }
 
-  // --- Metrics & Speed Calculation ---
+  private async waitForAckWindow(): Promise<void> {
+    const maxWindow = this.connectionMode === 'p2p-direct' ? 160 : 32;
+    if (this.inFlightIndices.size < maxWindow) {
+      return;
+    }
+
+    return new Promise<void>((resolve) => {
+      this.ackResolvers.push(resolve);
+      setTimeout(resolve, 80);
+    });
+  }
+
   private updateProgress() {
     const now = performance.now();
     const elapsedSec = (now - this.lastMetricsTimestamp) / 1000;
@@ -1132,29 +1187,18 @@ export class TransferManager {
     this.callbacks.onProgressUpdate(progress);
   }
 
-  // --- Wake Lock (Screen Dimming Prevention) ---
   private async acquireWakeLock() {
-    if ('wakeLock' in navigator) {
-      try {
-        this.wakeLockSentinel = await (navigator as any).wakeLock.request('screen');
-      } catch {
-        // Ignore permission failure
-      }
-    }
+    try {
+      await wakeLockManager.acquire();
+    } catch {}
   }
 
   private releaseWakeLock() {
-    if (this.wakeLockSentinel) {
-      try {
-        this.wakeLockSentinel.release();
-        this.wakeLockSentinel = null;
-      } catch {
-        // Ignore
-      }
-    }
+    try {
+      wakeLockManager.release();
+    } catch {}
   }
 
-  // --- Teardown & Ephemeral Cleanup ---
   public destroy() {
     this.isTransferring = false;
     this.releaseWakeLock();
@@ -1185,9 +1229,9 @@ export class TransferManager {
     this.pendingChunksQueue = [];
     this.pendingCandidates = [];
     this.earlySignals = [];
-    this.fileWritableStream = null;
     this.preparedBuffer = null;
     this.fileRef = null;
+    this.rawFilesList = [];
     this.inFlightIndices.clear();
     this.ackResolvers = [];
     this.completionResolver = null;

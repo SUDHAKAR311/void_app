@@ -21,9 +21,15 @@ import {
   Check,
   RotateCcw,
   Globe,
-  Info
+  Info,
+  Archive,
+  Users,
+  FileCheck,
+  Sun,
+  Image as ImageIcon
 } from 'lucide-react';
 import { motion } from 'motion/react';
+import { wakeLockManager, WakeLockStatus } from '../utils/wakeLockManager';
 
 interface TransferDashboardProps {
   role: VoidRole;
@@ -36,6 +42,7 @@ interface TransferDashboardProps {
   receivedText?: string;
   downloadBlob?: { blob: Blob; filename: string } | null;
   downloadUrl?: string;
+  unpackedFiles?: Array<{ name: string; blob: Blob; size: number }>;
   onCancel: () => void;
   onReset: () => void;
   onManualDownload?: () => void;
@@ -54,6 +61,7 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
   receivedText,
   downloadBlob,
   downloadUrl,
+  unpackedFiles,
   onCancel,
   onReset,
   onManualDownload,
@@ -64,7 +72,17 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
   const isError = propIsError ?? (status === 'error');
   const handleDownload = onManualDownload || onDownloadManual;
   const [copiedText, setCopiedText] = useState(false);
-  const [deviceStorage, setDeviceStorage] = useState<string>('');
+  const [wakeLockStatus, setWakeLockStatus] = useState<WakeLockStatus>(wakeLockManager.status);
+
+  useEffect(() => {
+    return wakeLockManager.subscribe(setWakeLockStatus);
+  }, []);
+
+  const isImage = Boolean(
+    metadata?.type?.startsWith('image/') ||
+    /\.(png|jpe?g|gif|webp|svg|bmp|avif|heic)$/i.test(metadata?.name || '') ||
+    /\.(png|jpe?g|gif|webp|svg|bmp|avif|heic)$/i.test(downloadBlob?.filename || '')
+  );
 
   const isVideo = Boolean(
     metadata?.type?.startsWith('video/') ||
@@ -77,21 +95,6 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
     /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(metadata?.name || '') ||
     /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(downloadBlob?.filename || '')
   );
-
-  useEffect(() => {
-    if (typeof navigator !== 'undefined' && 'storage' in navigator && 'estimate' in navigator.storage) {
-      navigator.storage.estimate().then((est) => {
-        if (est.quota !== undefined && est.usage !== undefined) {
-          const availableBytes = Math.max(0, est.quota - est.usage);
-          if (availableBytes >= 1024 * 1024 * 1024) {
-            setDeviceStorage(`${(availableBytes / (1024 * 1024 * 1024)).toFixed(1)} GB free`);
-          } else {
-            setDeviceStorage(`${(availableBytes / (1024 * 1024)).toFixed(0)} MB free`);
-          }
-        }
-      }).catch(() => {});
-    }
-  }, []);
 
   const formatBytes = (bytes: number): string => {
     if (!bytes) return '0 B';
@@ -122,33 +125,52 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
       await navigator.clipboard.writeText(receivedText);
       setCopiedText(true);
       setTimeout(() => setCopiedText(false), 2000);
-    } catch {
-      // Ignore
-    }
+    } catch {}
+  };
+
+  const downloadIndividualFile = (fileItem: { name: string; blob: Blob }) => {
+    const url = URL.createObjectURL(fileItem.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileItem.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
   };
 
   const getFileIcon = () => {
     if (!metadata) return <File className="w-8 h-8 text-teal-500" />;
+    if (metadata.isMultiFile) return <Archive className="w-8 h-8 text-teal-500" />;
     if (metadata.isText) return <FileText className="w-8 h-8 text-teal-500" />;
     if (metadata.type?.startsWith('video/')) return <Film className="w-8 h-8 text-teal-500" />;
     return <HardDrive className="w-8 h-8 text-teal-500" />;
   };
 
   const getModeBadge = () => {
+    if (metadata?.distributionMode === 'broadcast') {
+      return (
+        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium bg-teal-500/10 text-teal-600 dark:text-teal-400 border border-teal-500/20">
+          <Users className="w-3.5 h-3.5 text-teal-500" />
+          <span>Person to Many (Broadcast)</span>
+        </span>
+      );
+    }
+
     switch (progress.mode) {
       case 'p2p-direct':
         if (progress.networkRoute === 'local-lan') {
           return (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20" title="Direct Local LAN connection (Maximum Wi-Fi/Ethernet Speed)">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
               <Zap className="w-3.5 h-3.5 text-emerald-500" />
               <span>Direct LAN P2P (Max Speed)</span>
             </span>
           );
         }
         return (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20" title="Internet P2P: Speed is bounded by your internet upload speed">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
             <Globe className="w-3.5 h-3.5 text-amber-500" />
-            <span>Internet P2P (Upload Capped)</span>
+            <span>Internet P2P (1:1 Direct)</span>
           </span>
         );
       case 'turn-relay':
@@ -163,7 +185,7 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
         return (
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 border border-cyan-500/20">
             <Radio className="w-3 h-3 text-cyan-500" />
-            <span>Encrypted Tunnel Stream</span>
+            <span>RAM Stream Pipe</span>
           </span>
         );
     }
@@ -186,42 +208,45 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
       </div>
 
       {/* Top Status & Mode Header */}
-      <div className="flex items-center justify-between gap-3 pb-4 border-b border-neutral-100 dark:border-neutral-800">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-neutral-100 dark:border-neutral-800">
+        <div className="flex flex-wrap items-center gap-2">
           {getModeBadge()}
+          {wakeLockStatus.isActive && !isCompleted && !isError && (
+            <span 
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-mono font-medium bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/25"
+              title={wakeLockStatus.type === 'native' ? 'Screen Wake Lock API active' : 'Dual Video Fallback active (Mobile screen sleep prevented)'}
+            >
+              <Sun className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
+              <span>Screen Kept Awake</span>
+            </span>
+          )}
         </div>
 
-        <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-mono bg-teal-500/10 text-teal-600 dark:text-teal-400 border border-teal-500/20">
+        <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-mono bg-teal-500/10 text-teal-600 dark:text-teal-400 border border-teal-500/20 self-start sm:self-auto">
           <Lock className="w-3 h-3" />
           <span>AES-256-GCM</span>
         </div>
       </div>
 
-      {/* Item Summary Card with FULL Filename Visibility */}
+      {/* Item Summary Card */}
       <div className="mt-5 p-4 rounded-xl bg-neutral-50 dark:bg-neutral-950/60 border border-neutral-200/70 dark:border-neutral-800/70 flex items-start gap-4">
         <div className="p-3 rounded-lg bg-teal-500/10 border border-teal-500/20 shrink-0 mt-0.5">
           {getFileIcon()}
         </div>
         <div className="flex-1 min-w-0">
-          {/* Filename clearly and fully visible with word-wrapping */}
           <h3 className="text-base font-semibold text-neutral-900 dark:text-neutral-100 break-words [overflow-wrap:anywhere] leading-snug">
             {metadata?.name || 'Void Payload'}
           </h3>
           <p className="text-xs font-mono text-neutral-500 dark:text-neutral-400 mt-1">
             {metadata?.isText ? 'Clipboard Text' : formatBytes(metadata?.size || 0)}
+            {metadata?.isMultiFile ? ` • ${metadata.fileCount} files in batch` : ''}
             {metadata?.chunkCount ? ` • ${metadata.chunkCount.toLocaleString()} chunks` : ''}
           </p>
-          {deviceStorage && role === 'receiver' && (
-            <p className="text-[11px] font-mono text-teal-600 dark:text-teal-400 mt-1">
-              Device Storage: {deviceStorage}
-            </p>
-          )}
         </div>
       </div>
 
       {/* Main Transfer Visualizer */}
       <div className="mt-6">
-        {/* Progress Bar Header */}
         <div className="flex items-center justify-between text-xs font-mono mb-2">
           <span className="text-neutral-600 dark:text-neutral-400 font-semibold">
             {isCompleted
@@ -229,7 +254,7 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
               : isError
               ? 'Interrupted'
               : role === 'sender'
-              ? 'Pushing to recipient...'
+              ? (metadata?.distributionMode === 'broadcast' ? 'Broadcasting stream...' : 'Pushing to recipient...')
               : 'Pulling from sender...'}
           </span>
           <span className="text-sm font-bold font-mono text-teal-600 dark:text-teal-400">
@@ -237,7 +262,6 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
           </span>
         </div>
 
-        {/* Outer Progress Track */}
         <div className="h-3 w-full rounded-full bg-neutral-100 dark:bg-neutral-800 overflow-hidden relative">
           <motion.div
             className="h-full bg-gradient-to-r from-teal-500 via-emerald-400 to-teal-400 rounded-full transition-all duration-150 relative"
@@ -279,13 +303,12 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
           </div>
         </div>
 
-        {/* Network Route Advisory Tip */}
-        {progress.networkRoute !== 'local-lan' && !isCompleted && !isError && (
+        {progress.networkRoute !== 'local-lan' && metadata?.distributionMode !== 'broadcast' && !isCompleted && !isError && (
           <div className="mt-3 px-3.5 py-2.5 rounded-xl bg-amber-500/5 dark:bg-amber-500/10 border border-amber-500/20 text-[11px] font-mono text-neutral-600 dark:text-neutral-400 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 text-left">
             <div className="flex items-start gap-2.5">
               <Info className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
               <span>
-                Transferring over public internet route. If both devices are on the same Wi-Fi, disabling router <strong className="text-neutral-900 dark:text-neutral-200">AP/Client Isolation</strong> enables direct LAN transfer (30–60+ MB/s).
+                Transferring over internet route. Same-network Wi-Fi devices transfer at high local LAN speeds.
               </span>
             </div>
             {onOpenSpeedGuide && (
@@ -299,6 +322,19 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
             )}
           </div>
         )}
+
+        {/* Screen Sleep Prevention indicator banner */}
+        {wakeLockStatus.isActive && !isCompleted && !isError && (
+          <div className="mt-3 px-3.5 py-2.5 rounded-xl bg-amber-500/10 dark:bg-amber-500/15 border border-amber-500/25 flex items-center justify-between text-xs font-mono text-neutral-700 dark:text-neutral-200">
+            <div className="flex items-center gap-2">
+              <Sun className="w-4 h-4 text-amber-500 shrink-0" />
+              <span>Screen kept awake while transferring</span>
+            </div>
+            <span className="text-[10px] text-amber-700 dark:text-amber-400 font-semibold px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">
+              {wakeLockStatus.type === 'native' ? 'Native Wake Lock' : 'Dual Video Fallback'}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Completed State Actions */}
@@ -309,7 +345,7 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
             <span>Encrypted transfer verified bit-for-bit</span>
           </div>
 
-          {/* Text clipboard download/copy */}
+          {/* Text clipboard */}
           {receivedText && (
             <div className="mt-3">
               <div className="p-3 rounded-lg bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 text-xs font-mono text-neutral-800 dark:text-neutral-200 max-h-32 overflow-y-auto break-all">
@@ -326,13 +362,13 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
             </div>
           )}
 
-          {/* Instant zero-buffering video player */}
+          {/* Instant video playback */}
           {downloadBlob && isVideo && downloadUrl && (
             <div className="mt-3 overflow-hidden rounded-xl border border-neutral-200 dark:border-neutral-800 bg-black shadow-lg">
               <div className="px-3 py-2 bg-neutral-900 border-b border-neutral-800 flex items-center justify-between text-[11px] font-mono text-neutral-400">
                 <span className="flex items-center gap-1.5 text-emerald-400 font-semibold">
                   <Film className="w-3.5 h-3.5" />
-                  Instant Video Playback (0% Buffering)
+                  Instant Video Playback
                 </span>
                 <span className="truncate max-w-[150px]">{downloadBlob.filename}</span>
               </div>
@@ -347,7 +383,7 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
             </div>
           )}
 
-          {/* Instant audio player */}
+          {/* Instant audio playback */}
           {downloadBlob && isAudio && downloadUrl && (
             <div className="mt-3 p-3 rounded-xl border border-neutral-200 dark:border-neutral-800 bg-neutral-900/90 shadow-md">
               <div className="text-[11px] font-mono text-neutral-400 mb-2 flex items-center gap-1.5 text-emerald-400 font-semibold">
@@ -364,7 +400,41 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
             </div>
           )}
 
-          {/* File download button */}
+          {/* MULTI-FILE UNPACKED LIST: Individual & Batch Download */}
+          {unpackedFiles && unpackedFiles.length > 0 && (
+            <div className="mt-3 p-3 rounded-xl bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 text-xs font-mono">
+              <div className="flex items-center justify-between pb-2 mb-2 border-b border-neutral-200 dark:border-neutral-800">
+                <span className="font-semibold text-neutral-800 dark:text-neutral-200 flex items-center gap-1.5">
+                  <FileCheck className="w-4 h-4 text-emerald-500" />
+                  <span>{unpackedFiles.length} Files Ready</span>
+                </span>
+                <span className="text-[11px] text-neutral-400">Download individually or all at once</span>
+              </div>
+
+              <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                {unpackedFiles.map((fileItem, idx) => (
+                  <div
+                    key={idx}
+                    className="flex items-center justify-between p-2 rounded-lg bg-neutral-50 dark:bg-neutral-950 border border-neutral-200/60 dark:border-neutral-800/60"
+                  >
+                    <div className="min-w-0 flex-1 mr-2">
+                      <p className="truncate font-medium text-neutral-900 dark:text-neutral-100">{fileItem.name}</p>
+                      <p className="text-[10px] text-neutral-400">{formatBytes(fileItem.size)}</p>
+                    </div>
+                    <button
+                      onClick={() => downloadIndividualFile(fileItem)}
+                      className="px-2.5 py-1 rounded bg-teal-500/10 text-teal-600 dark:text-teal-400 hover:bg-teal-500/20 text-[11px] font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                    >
+                      <Download className="w-3 h-3" />
+                      <span>Save</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* File download button (Full Archive or Single File) */}
           {downloadBlob && (
             <div className="mt-3">
               <button
@@ -373,7 +443,11 @@ export const TransferDashboard: React.FC<TransferDashboardProps> = ({
                 className="w-full inline-flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-gradient-to-r from-teal-500 to-emerald-400 text-neutral-950 font-mono text-xs font-bold hover:brightness-105 transition-all shadow-md cursor-pointer"
               >
                 <Download className="w-4 h-4" />
-                <span>Save File to Device ({formatBytes(downloadBlob.blob.size)})</span>
+                <span>
+                  {unpackedFiles && unpackedFiles.length > 1
+                    ? `Save All as ZIP Archive (${formatBytes(downloadBlob.blob.size)})`
+                    : `Save File to Device (${formatBytes(downloadBlob.blob.size)})`}
+                </span>
               </button>
             </div>
           )}
